@@ -1,0 +1,1846 @@
+#include "rsharp.h"
+#include "core_globals.h"
+
+#define BBSIZE 65536
+
+void LoadDefs(void)
+{
+    VALUE code;
+    FILE *fp;
+    char *buf, line[256];
+    ULONG len, i;
+
+    if ((fp = fopen("boot.rs", "r")) == NULL)
+    {
+        printf("\n** File: boot.rs not found!\n");
+        return;
+    }
+    if ((buf = (char *) malloc(BBSIZE)) == NULL)
+    {
+        printf("\n** LoadDefs: cannot allocate buffer !\n");
+        return;
+    }
+    i = 0;
+    *buf = 0;
+    while(!feof(fp))
+    {
+        len = fread(line, sizeof(char), 256, fp);
+        strncat(buf, line, len);
+        i += len;
+    }
+    fclose(fp);
+
+    code = Tokenize(buf, NULL);
+    free((void *)buf);
+
+    if (CheckError(code))
+        return;
+    if (CheckError(Execute(code)))
+        return;
+}
+
+int main(void)
+{
+    printf("--- R# v0.6.0 - Alpha ---\n");
+
+    /* --- Booting --- */
+
+    InitMem();
+    global_ctx = NewContext(GLOBAL_CTX_SIZE);
+    InitSymbolsTable();
+    InitDatatypes();
+
+    unset_value = &unset_struct_value;
+    unset_value->type = TYPE_UNSET;
+
+    none_value = &none_struct_value;
+    none_value->type = TYPE_NONE;
+    SetContextDef(global_ctx, NewWord("none", 4, TYPE_WORD), none_value);
+
+    true_value = &true_logic_value;
+    true_value->type = TYPE_LOGIC;
+    true_value->data = 0;
+    SetContextDef(global_ctx, NewWord("true", 4, TYPE_WORD), true_value);
+
+    false_value = &false_logic_value;
+    false_value->type = TYPE_LOGIC;
+    false_value->data = 1;
+    SetContextDef(global_ctx, NewWord("false", 5, TYPE_WORD), false_value);
+
+    BuildNativeMakeFunction();
+    BuildNativeMakeOp();
+    MakeAllNatives(global_ctx);
+    InitInterpreter();
+
+    main_task = NewTask(&main_task);
+
+    LoadDefs();
+
+    RS_Stats(NULL, NULL);
+
+/*	printf("function! => %ld\n", sizeof(struct VALUE_FUNCTION));*/
+
+    console();
+}
+#include "rsharp.h"
+
+char CheckError(VALUE value)
+{
+    VERROR	err;
+
+    if (TYPE(value) == TYPE_ERROR)
+    {
+        err = (VERROR) value;
+        printf("%s\n", err->message);
+        return 1;
+    }
+    return 0;
+}
+
+void process(char *data)
+{
+    VALUE code, ret;
+
+    code = Tokenize(data, NULL);
+    if (CheckError(code))
+        return;
+    BindToContext(global_ctx, code);
+    ret = Execute(code);
+
+    if (CheckError(ret))
+        return;
+    if (IS_ANY_FUNC(ret) || TYPE(ret) == TYPE_UNSET)
+        return;
+    printf("== ");
+    ret = RS_Mold(&ret, NULL);
+    printf("%s\n", ((VSTRING)ret)->data);
+}
+
+void console(void)
+{
+   char buffer[1024];
+
+   printf("\nEntering Console mode...\n");
+   for(;;)
+   {
+        printf(">> ");
+        fgets(buffer, 1024, stdin);	/* more secure than gets, overflow control | BHA 28/04/2003 */
+
+        if (*buffer != '\n')		/* Test for non-empty entry */
+            process(buffer);
+   }
+}
+
+VALUE RS_Output(VALUE *args, VALUE *refs)
+{
+    VSTRING p;
+    ULONG i;
+
+    _ASSERT(TYPE(args[0]) == TYPE_STRING);
+
+    p = STRING(args[0]);
+    for(i = p->head; i < p->tail; i++)
+        fputc(p->data[i], stdout);
+
+    if (refs)
+        printf("\n");
+
+    return unset_value;
+}
+#include "rsharp.h"
+
+/* For debugging only */
+
+char *types_name[] = {
+    "block!", "word!", "set-word!", "get-word!", "lit-word!", "integer!", "decimal!", "string!",
+    "char!", "bitset!"
+};
+
+void DumpBlock(VBLOCK p)
+{
+    VHEADER vh;
+    UBYTE	i;
+
+    printf("[");
+    for(i = 0; i < p->tail; i++)
+    {
+        vh = (VHEADER) p->data[i];
+        if (vh->type == TYPE_BLOCK)
+            DumpBlock(p->data[i]);
+        else
+            printf("%s", types_name[vh->type - 1]);
+        if (i < p->tail - 1) printf(" ");
+    }
+    printf("]");
+}
+
+void DumpContext(VCONTEXT ctx)
+{
+    ULONG i;
+
+    printf("\n##Context Dump :\n");
+    for (i = 0; i < ctx->tail; i++)
+        printf("%s ", GetSymbol(ctx->table[i].symbol));
+}
+
+
+void DumpValueFrame(SFRMV *frm)
+{
+    FILE *fp;
+    ULONG i;
+    VALUE val;
+    UBYTE flag;
+    char name[80];
+    static ULONG cnt;
+
+    sprintf(name, "values%00lu.log", cnt++);
+    fp = fopen(name, "w");
+
+    fprintf(fp, "\n====Début====\n");
+    for(i = 0; i < MAX_VALUES; i++)
+    {
+        val = (void *)((char *)frm->base + i * max_value_size);
+        if (TYPE(val) > 0)
+        {
+            fprintf(fp, "%u\t: %u, %s", i, HEADER(val)->mark, GetTypeName(val));
+            if (VTABLE(val)->Mold)
+                fprintf(fp, ", %s",VTABLE(val)->Mold(val, &flag));
+            fprintf(fp, "\n");
+        }
+    }
+    fprintf(fp, "=============\n");
+    fclose(fp);
+}
+#include "rsharp.h"
+
+VTASK *task_list[32];
+ULONG task_count;
+
+ACTIONPTR	OnExprDone;
+
+VTASK NewTask()
+{
+    VTASK p;
+
+    p = (VTASK) malloc(sizeof(struct VALUE_TASK));
+    if (p == NULL)
+        printf("***Out of memory !\n");
+
+    p->funcs = malloc(FUNC_STK_SIZE * sizeof(struct exec_slot));
+    if (p->funcs == NULL)
+        printf("***Out of memory !\n");
+
+    p->calls = malloc(FUNC_STK_SIZE * sizeof(struct call_slot));
+    if (p->calls == NULL)
+        printf("***Out of memory !\n");
+
+    p->values = malloc(1024 * sizeof(void *));
+    if (p->funcs == NULL)
+        printf("***Out of memory !\n");
+
+    p->last = (CALLSLOT *)((char *)p->funcs + (FUNC_STK_SIZE - 1) * sizeof(struct call_slot));
+
+    return p;
+}
+
+void InitInterpreter()
+{
+    /* init code */
+}
+
+void InitTask(VTASK task, VBLOCK code)
+{
+    task->top = 0;
+    task->infix = 0;
+    task->last = NULL;
+    task->word = NULL;
+    task->path = NULL;
+    task->value = NULL;
+
+    task->call = task->calls;
+    task->exec = task->funcs;
+    task->exec->ident = ACTION_DO;
+    task->exec->on_expr_done = NULL;
+    task->exec->blk = code;
+    task->exec->idx = code->head;
+    task->exec->base = task->call;
+    task->exec->result = unset_value;
+
+    task->values[0] = NULL;
+}
+
+void FreeTask(VTASK p)
+{
+    free(p->calls);
+    free(p->values);
+    free(p->funcs);
+    free(p);
+}
+
+UBYTE CheckRefinements(VTASK p)
+{
+    ULONG i;
+    VANYFUNC func;
+    VREFINEMENT ref, funcref;
+
+    func = p->call->func;
+    func->totalcnt = func->argcount;
+
+    if (!func->refines)
+        return 0; 
+
+    funcref = NULL; 
+    p->call->refs_idx = p->top + 1;
+
+    for (i = p->path->head + 1; i < p->path->tail; i++)
+    {
+        if (TYPE(p->path->data[i]) != TYPE_WORD)
+            return 0;
+
+        ref = func->refines; 
+        while (ref)
+        {
+            /* Should be optimized */
+            if (strcmplower(GetSymbol(WORD(p->path->data[i])->symbol), GetSymbol(ref->word->symbol)))
+            {
+                PUSH(ref);				/* Push refinement on value stack */
+                func->totalcnt += ref->argcount;
+                if (funcref)
+                    funcref->next = ref;
+                funcref = ref;
+                break;
+            }
+            ref = ref->next;
+        }
+    }
+    p->call->args_idx = p->top + 1;		/* save refinements list ending pos */
+    return 1;
+}
+
+UBYTE TypeCheckArgs(VTASK p)
+{
+    VANYFUNC func;
+    VFUNCTION fun;
+    VREFINEMENT ref;
+    VBLOCK blk;
+    UWORD i, j, cnt, ri;
+    ULONG l; 
+    UBYTE local_ctx;
+    VALUE *stack;
+
+    func = p->call->func;
+
+    /* Init all locals to none */
+    if (local_ctx = (TYPE(func) == TYPE_FUNCTION))
+    {
+        fun = FUNCTION(func);
+        blk = fun->locals;
+        for(l = blk->head; l < blk->tail; l++)
+            if (TYPE(blk->data[l]) == TYPE_REFINEMENT)
+                SetContextDef(fun->ctx, REFINEMENT(blk->data[l])->word, none_value);
+            else
+                SetContextDef(fun->ctx, WORD(blk->data[l]), none_value);
+    }
+
+    stack = p->values + p->call->args_idx;
+
+    /* Mandatory arguments type checking */
+
+    for (i = 0; i < func->argcount ; i++)
+    {
+        if (!(IN_BITSET(func->args[i], TYPE(stack[i]))))
+            return 0;											/* Type check failed */
+        if (local_ctx)
+            SetContextDef(fun->ctx, fun->locals->data[i], stack[i]);
+    }
+
+    if (!func->refines || !p->call->refs_idx) 
+        return 1;
+
+    /* Optional arguments type checking */
+
+    ri = i;														/* refinement arg index in fun->locals */
+    for (j = p->call->refs_idx; j < p->call->args_idx; j++)
+    {
+        ref = REFINEMENT(p->values[j]);
+        if (local_ctx)
+            SetContextDef(fun->ctx, ref->word , true_value);
+        ri++;													/* skip the refinement */
+
+        for (cnt = 0; cnt < ref->argcount; cnt++)
+        {
+            if (!(IN_BITSET(ref->args[cnt], TYPE(stack[i]))))
+                return 0;										/* Type check failed */
+            if (local_ctx)
+                SetContextDef(fun->ctx, fun->locals->data[ri], stack[i]);
+            i++;
+            ri++;												/* next argument word in locals */
+        }
+        p->values[j] = (void *)(ULONG)ref->index;						/* Exchange in stack ref pointer <=> ref index */
+    }
+    return 1;
+}
+
+void *PathEval(VTASK p, VPATH path, UBYTE set)
+{
+    VALUE	refine, reduced;
+    ULONG	pos;
+
+    pos = path->head;
+    reduced = path->data[pos++];
+
+    while (pos < path->tail)
+    {
+        refine = path->data[pos++];
+
+        if (IS_ANY_WORD(reduced))
+            reduced = GetValueWord(WORD(reduced));
+
+        if (TYPE(reduced) == TYPE_UNSET)
+        {
+            p->value = NewError(1, 7, NULL);
+            return GO_ERROR;
+        }
+        if (set && pos == path->tail)
+        {
+            if (VTABLE(reduced)->SetPath)
+            {
+                p->value = VTABLE(reduced)->SetPath(reduced, refine, p->value);
+                return GO_POP_CALL;
+            }
+            else
+            {
+                p->value = NewError(1, 12, NULL);
+                return GO_ERROR;
+            }
+        }
+        if (IS_ANY_FUNC(reduced))
+        {
+            p->value = reduced;
+            return GO_PUSH_CALL;
+        }
+        if (VTABLE(reduced)->PathEval)
+            reduced = VTABLE(reduced)->PathEval(reduced, refine);
+        else
+        {
+            p->value = NewError(1, 12, NULL);
+            return GO_ERROR;
+        }
+    }
+    p->value = reduced;
+    return GO_PUSH_VALUE;
+}
+
+VALUE ThrowException(VTASK p, ULONG kind, UWORD ern)
+{
+    while (p->exec->ident != kind)
+    {
+        if (p->exec == p->funcs)
+        {
+            p->value = NewError(3, ern, NULL);
+            return GO_POP_CALL;
+        }
+        p->exec -= 1;
+    }
+    return GO_POP_DO;
+}
+
+void EvalStateMachine(VTASK p)
+{
+    VALUE	ret;
+
+
+ESM_FETCH_VALUE:
+
+    if (p->exec->idx == p->exec->blk->tail)
+        if (p->exec == p->funcs)
+            goto ESM_FINISH;
+        else
+            goto ESM_POP_DO;
+
+    p->value = (VALUE) p->exec->blk->data[p->exec->idx++]; 
+    switch (TYPE(p->value))
+    {
+        case TYPE_PAREN:	goto ESM_EXEC_DO;
+        case TYPE_SET_PATH:
+        case TYPE_SET_WORD: goto ESM_PUSH_CALL;
+        case TYPE_GET_WORD:
+        case TYPE_WORD:		goto ESM_EVAL_WORD;
+        case TYPE_PATH:		goto ESM_EVAL_PATH;
+        case TYPE_LIT_WORD:
+            p->value = AltNewWord(p->value);
+            goto ESM_PUSH_VALUE; 
+
+        case TYPE_LIT_PATH:
+            p->value = AltNewPath(p->value);
+            goto ESM_PUSH_VALUE; 
+
+        default: goto ESM_PUSH_VALUE;
+    }
+
+
+ESM_EVAL_WORD:
+
+    p->word = WORD(p->value);
+    p->value = GetContextDef(p->word->ctx, p->word->ctx_idx, p->word->symbol);
+    if (p->value == NULL)
+    {
+        p->value = NewError(1, 7, p->exec->blk);
+        goto ESM_RAISE_ERROR;
+    }
+    if ((TYPE(p->word) != TYPE_GET_WORD) && IS_ANY_FUNC(p->value))
+    {
+        p->path = NULL;					/* No refinement */
+        ANYFUNC(p->value)->totalcnt = ANYFUNC(p->value)->argcount;
+        goto ESM_PUSH_CALL;
+    }
+    goto ESM_PUSH_VALUE;
+
+
+ESM_EVAL_PATH:
+
+    p->path = PATH(p->value);
+    ret = PathEval(p, p->path, 0);
+    switch ((ULONG)ret)
+    {
+        case (ULONG)GO_PUSH_VALUE:	goto ESM_PUSH_VALUE;
+        case (ULONG)GO_PUSH_CALL:	goto ESM_PUSH_CALL;
+        case (ULONG)GO_ERROR:		goto ESM_RAISE_ERROR;
+    }
+
+
+ESM_PUSH_CALL:
+            
+    if (p->call == p->last)
+    {
+        p->value = NewError(1, 26, p->exec->blk);		/* Stack Overflow */
+        goto ESM_RAISE_ERROR;
+    }
+        
+    p->call += 1;
+    p->call->func = p->value;
+    p->call->on_expr_done = NULL;
+    p->call->referer = p->path ? (VALUE)p->path : (VALUE)p->word;
+    p->call->args_idx = p->top + (p->infix ? 0 : 1);
+    p->call->refs_idx = 0;
+
+    if ((TYPE(p->value) == TYPE_SET_WORD) || (TYPE(p->value) == TYPE_SET_PATH))
+    {
+        p->call->remaining = 1;
+        goto ESM_FETCH_VALUE;
+    }
+
+    if (p->path)
+    {
+        if (!CheckRefinements(p))
+        {
+            p->value = NewError(1, 13, p->exec->blk);
+            goto ESM_RAISE_ERROR;
+        }
+    }
+    else
+        p->call->refs_idx = 0;
+
+    p->call->remaining = ANYFUNC(p->value)->totalcnt;		/* Argument number needed for the pending call */
+    if (p->call->remaining == 0)
+        goto ESM_EXEC_CALL;
+
+    if (p->infix)
+    {
+        p->infix = 0;
+        p->call->remaining--;				/* 1st argument already on stack */
+    }
+    goto ESM_FETCH_VALUE;
+
+
+ESM_PUSH_VALUE:
+
+    /* Infix operator priority detection (should be optimized in speed) */
+    p->infix = (
+        (p->exec->idx < p->exec->blk->tail - 1) 
+        && (TYPE(p->exec->blk->data[p->exec->idx]) == TYPE_WORD)
+        && (TYPE(GetValueWord(WORD(p->exec->blk->data[p->exec->idx]))) == TYPE_OP)
+    );
+
+    if (p->call == p->exec->base)
+    {										/* No pending call */ 
+        if (TYPE(p->value) == TYPE_ERROR)
+            goto ESM_RAISE_ERROR;
+
+        if (!p->infix)
+            goto ESM_EXPR_DONE;
+    }
+
+    PUSH(p->value);							/* Push a new argument */
+
+    if (p->infix)
+        goto ESM_FETCH_VALUE;				/* Infix expression predicted => go get the operator */
+
+    if (--p->call->remaining > 0)
+        goto ESM_FETCH_VALUE;				/* Not enough arguments to trigger a call */
+
+    if (TYPE(p->call->func) == TYPE_SET_WORD)
+        goto ESM_EXEC_SET;
+
+    if (TYPE(p->call->func) == TYPE_SET_PATH)
+        goto ESM_EXEC_SETPATH;
+
+    goto ESM_EXEC_CALL;						
+
+
+ESM_EXEC_CALL:
+            
+    if (!TypeCheckArgs(p))
+    {
+        if (TYPE(p->value) != TYPE_ERROR)
+            p->value = NewError(1, 14, p->exec->blk);
+        goto ESM_RAISE_ERROR; 
+    }
+    switch (TYPE(p->call->func))
+    {
+        case TYPE_NATIVE: 
+        case TYPE_OP:		goto ESM_EXEC_NATIVE;
+        case TYPE_ACTION:	goto ESM_EXEC_ACTION;
+        case TYPE_FUNCTION: 
+            p->value = FUNCTION(p->call->func)->body;	
+            goto ESM_EXEC_DO;
+    }
+
+    
+ESM_EXEC_DO:
+
+    p->exec += 1;
+    p->exec->ident = ACTION_FUNC;
+    p->exec->blk = p->value;
+    p->exec->idx = BLOCK(p->value)->head;
+    p->exec->on_expr_done = NULL;
+    p->exec->result = NULL;
+    p->exec->base = p->call;
+    goto ESM_FETCH_VALUE;
+
+
+ESM_EXEC_ACTION:
+
+    if (p->call->refs_idx)									/* test refinements presence */
+        ret = ACTION(p->call->func)->body(
+            p,												/* VTASK */
+            p->values + p->call->args_idx,					/* args */
+            p->values + p->call->refs_idx	/* refs */
+        );
+    else
+        ret = ACTION(p->call->func)->body(
+            p,												/* VTASK */
+            p->values + p->call->args_idx,					/* args */
+            NULL											/* No refinements */
+        );
+    switch ((ULONG)ret)
+    {
+        case (ULONG)GO_POP_DO:		goto ESM_POP_DO;
+        case (ULONG)GO_POP_CALL:	goto ESM_POP_CALL;
+        case (ULONG)GO_FETCH:		goto ESM_FETCH_VALUE;
+    }
+        
+
+ESM_EXEC_NATIVE:
+
+    if (p->call->refs_idx)									/* test refinements presence */
+        p->value = NATIVE(p->call->func)->body(
+            p->values + p->call->args_idx ,					/* args */
+            (VALUE *) p->values + p->call->refs_idx			/* refs */
+        );
+    else
+        p->value = NATIVE(p->call->func)->body(
+            p->values + p->call->args_idx,					/* args */
+            NULL											/* no refinements */
+        );
+
+    if (TYPE(p->value) == TYPE_NATIVE)			/* If result is native!, reuse the call slot */
+    {
+        p->path = NULL;
+        p->call->args_idx += ANYFUNC(p->call->func)->totalcnt;	/* Jump over the previous args */
+        p->call->func = p->value;		
+        p->call->remaining = NATIVE(p->value)->totalcnt = NATIVE(p->value)->argcount;
+        goto ESM_FETCH_VALUE;
+    }
+    goto ESM_POP_CALL;
+
+
+ESM_EXEC_SET:
+
+    p->word = WORD(p->call->func);
+    p->value = SetContextDef(p->word->ctx, p->word, p->value);
+    goto ESM_POP_CALL;
+
+
+ESM_EXEC_SETPATH:
+
+    ret = PathEval(p, PATH(p->call->func), 1);
+    if (ret == GO_POP_CALL)
+        goto ESM_POP_CALL;
+    else
+        goto ESM_RAISE_ERROR;
+
+
+ESM_POP_DO:
+
+    p->call = p->exec->base;
+    p->exec -= 1;
+    if (p->call != p->exec->base)
+        goto ESM_POP_CALL;
+    else
+        goto ESM_PUSH_VALUE;
+
+
+ESM_POP_CALL:
+
+    while (p->call->remaining == 0)
+    {
+        p->top = (p->call->refs_idx ? p->call->refs_idx : p->call->args_idx) - 1;
+        p->call -= 1;
+        if (p->call == p->exec->base)
+            break;
+    }
+    goto ESM_PUSH_VALUE;
+
+
+ESM_EXPR_DONE:
+
+    OnExprDone = p->exec->on_expr_done;
+    if (OnExprDone)
+    {
+        ret = OnExprDone(p,
+                p->values + p->exec->base->args_idx,
+                p->values + p->exec->base->refs_idx);
+
+    }
+    
+    p->exec->result = p->value;
+    goto ESM_FETCH_VALUE;
+
+
+ESM_RAISE_ERROR:
+
+    while (p->exec != p->funcs)
+    {
+        if (p->exec->ident == ACTION_TRY)
+            goto ESM_POP_DO;
+        p->exec -= 1;
+    }
+    p->exec->result = p->value;
+    /* goto ESM_POP_DO; */
+
+
+ESM_FINISH:
+
+    if (p->exec->result == NULL)
+        p->exec->result = unset_value;
+    else
+    {
+        if (TYPE(p->exec->result) != TYPE_ERROR)
+            if ((p->call != p->exec->base) && (p->call->remaining > 0))
+                p->exec->result = NewError(1, 8, p->exec->blk);		/* Missing argument */
+    } 
+}
+
+
+VALUE Evaluate(VTASK task, VBLOCK code)
+{
+    InitTask(task, code);
+
+    EvalStateMachine(task);
+
+/*
+    #if MEM_TEST == 1
+        MemTest();
+    #endif
+
+    CheckGC();
+*/	
+    return task->exec->result;							/* Returns last value */
+}
+
+
+VALUE Execute(VALUE p)
+{
+    switch(TYPE(p))
+    {
+        case TYPE_BLOCK: 
+            return Evaluate(main_task, p);
+
+        case TYPE_STRING: 
+            p = Tokenize(STRING(p)->data, NULL);
+            _ASSERT(TYPE(p) != TYPE_ERROR);
+            return Evaluate(main_task, p);
+
+        default: return p;
+    }
+}
+
+VALUE RS_Mold(VALUE *args, VALUE *refs)
+{
+    VSTRING p;
+    char *molded;
+    UBYTE save;
+
+    save = 0;
+    molded = VTABLE(args[0])->Mold(args[0], &save);
+    p = NewString(molded, -1);
+    if (save)
+        p->save = 1;					/* Don't free the buffer with the string value */
+    return (VALUE)p;
+}
+
+
+VALUE RS_Form(VALUE *args, VALUE *refs)
+{
+    VSTRING p;
+    char *formed;
+    UBYTE save;
+
+    save = 0;
+    formed = VTABLE(args[0])->Form(args[0], &save);
+    p = NewString(formed, -1);
+    if (save)							
+        p->save = 1;					/* Don't free the buffer with the string value */
+    return (VALUE)p;
+}
+#include "rsharp.h"
+
+
+/*=== VALUES memory management ===*/
+
+
+void FormatValueFrame(SFRMV *frm)
+{
+    ULONG i;
+    void **p;
+
+    p = frm->stack;
+    for(i = 0; i < MAX_VALUES; i++, p++)
+    {
+        *p = (void *)((char *)frm->base + ((MAX_VALUES - 1) * max_value_size) - i * max_value_size);
+        **((ULONG **)p) = 0L;				/* Reset value header */
+    }
+}
+
+void *AllocValueFrame()
+{
+    SFRMV *p, *last;
+
+    p = malloc(FRM_VALUE_SIZE);
+    if (p == NULL)
+        return NULL;						/* Init error : cannot allocated 1st frame ! */
+
+    last = mem.values.head;
+    if (last)
+    {
+        while (last->next != NULL) 
+            last = last->next;
+        last->next = p;
+    }
+    else
+        mem.values.head = p;
+
+    p->next = NULL;
+    p->stack = (void *)((char *)p + struct_frame_value_size);
+    p->base = (void *)((char *)p->stack + MAX_VALUES * sizeof(void *));
+    p->top = (void **)((char *)p->base - 4);
+    
+    mem.values.active = p;
+    FormatValueFrame(p);					/* Fill the stack with cells address */
+
+
+    return p;
+}
+
+void *InitValueMem()
+{
+    struct_frame_value_size = sizeof(struct frame_value);
+    max_value_size = sizeof(struct VALUE_FUNCTION);			/* => !! should be a multiple of 8 !! */
+
+    mem.values.head = NULL;
+    mem.values.active = NULL;
+
+    AllocValueFrame();
+    return mem.values.head;
+}
+
+void *AllocValue()
+{
+    void *p;
+
+    #if DEBUG_MEM == 1
+        printf("mem : alloc value \n");
+    #endif 
+
+    if ((void *)mem.values.active->top == mem.values.active->stack)
+        AllocValueFrame();					/* alloc a new frame */
+
+    p = *mem.values.active->top;
+    HEADER(p)->mark = 0;
+    mem.values.active->top--;				/* take next free slot */
+    return p;
+}
+
+void *CloneValue(VALUE p)
+{
+    VALUE n;
+
+    n = AllocValue();
+    memcpy(n, p, max_value_size);
+    return n;
+}
+
+/*=== Raw DATA memory management ===*/
+
+
+void *AllocMem(ULONG size)
+{
+    void *p;
+
+    p = malloc(size + MBH_SIZE);
+    if (p == NULL)
+        printf("*** Out of memory\n");
+
+    #if DEBUG_MEM == 1
+        printf("mem : alloc data size   = %lu\n", size);
+    #endif 
+    
+    SBH(p)->size = size;
+    SBH(p)->mark = 0;
+    SBH(p)->save = 0;
+
+    if (mem.data.head)
+    {
+        SBH(p)->prev = mem.data.tail;
+        SBH(p)->next = mem.data.tail->next;
+        mem.data.tail->next = SBH(p);
+        mem.data.tail = SBH(p);
+    }
+    else
+    {
+        mem.data.head = mem.data.tail = SBH(p);
+        SBH(p)->prev = NULL;
+        SBH(p)->next = NULL;
+    }
+
+    return GET_MB_DATA(p);
+}
+
+void *AllocMemForever(ULONG size)
+{
+    void *data;
+
+    data = AllocMem(size);
+    SBH(GET_MB_HEAD(data))->save = 1;
+    return data;
+}
+
+void FreeMem(void *data)
+{
+    MBH *p;
+
+    p = GET_MB_HEAD(data);
+
+    #if DEBUG_MEM == 1
+        printf("mem : freeing data size = %lu\n", p->size);
+    #endif 
+    
+    if (p->prev)
+        p->prev->next = p->next;
+    else
+        mem.data.head = p->next;
+
+    if (p->next)
+        p->next->prev = p->prev;
+    else
+        mem.data.tail = p->prev;
+
+    free((void *)p);
+}
+
+void *ReAllocMem(void *p, ULONG size)
+{
+    MBH *mb_prev, *mb_next, *n;
+
+    n = GET_MB_HEAD(p);
+
+    #if DEBUG_MEM == 1
+        printf("mem : expanding  %lu => %lu\n", n->size, size);
+    #endif 
+
+    mb_prev = n->prev;
+    mb_next = n->next;
+    n = realloc(n, size + MBH_SIZE);
+    if (n == NULL)
+        printf("*** Out of memory\n");
+
+    n->size = size;
+
+    if (mb_prev)
+        mb_prev->next = n;
+    else
+        mem.data.head = n;
+
+    if (mb_next)
+        mb_next->prev = n;
+    else
+        mem.data.tail = n;
+
+    return GET_MB_DATA(n);
+}
+
+/*----------- Garbage Collector ------------*/
+
+void MarkValue(VALUE);
+
+void MarkBlock(VBLOCK blk)
+{
+    ULONG i;
+
+    SBH(GET_MB_HEAD(blk->data))->mark = 1;
+
+    for (i = 0; i < blk->tail; i++)
+        MarkValue(blk->data[i]);
+}
+
+void MarkValue(VALUE p)
+{
+    VREFINEMENT ref;
+    UWORD i;
+
+    if (HEADER(p)->mark)
+        return;
+
+    HEADER(p)->mark = 1;
+
+    if (IS_ANY_BLOCK(p))
+    {
+        MarkBlock(BLOCK(p));
+        return;
+    }
+    if (IS_ANY_STRING(p))
+    {
+        SBH(GET_MB_HEAD(STRING(p)->data))->mark = 1;
+        return;
+    }
+    if (TYPE(p) == TYPE_CONTEXT)
+    {
+        SBH(GET_MB_HEAD(CONTEXT(p)->table))->mark = 1;
+        return;
+    }
+    if (TYPE(p) == TYPE_ERROR)
+    {
+        SBH(GET_MB_HEAD(ERROR(p)->message))->mark = 1;
+        return;
+    }
+    if (IS_ANY_FUNC(p))
+    {
+        HEADER(ANYFUNC(p)->specs)->mark = 1;
+        MarkBlock(ANYFUNC(p)->specs);
+
+        if (ANYFUNC(p)->locals)
+        {
+            HEADER(ANYFUNC(p)->locals)->mark = 1;
+            MarkBlock(ANYFUNC(p)->locals);
+        }
+        ref = ANYFUNC(p)->refines;
+        if (ref)
+        {
+            while (ref)
+            {
+                ref->mark = 1;
+                ref->word->mark = 1;
+                if (ref->argcount)
+                {
+                    for(i = 0; i < ref->argcount; i++)
+                        SBH(GET_MB_HEAD(ref->args[i]))->mark = 1;
+                    SBH(GET_MB_HEAD(ref->args))->mark = 1;
+                }
+                ref = ref->next;
+            }
+        }
+        if (TYPE(p) == TYPE_FUNCTION)
+        {
+            HEADER(FUNCTION(p)->body)->mark = 1;
+            MarkBlock(BLOCK(FUNCTION(p)->body));
+            FUNCTION(p)->ctx->mark = 1;
+        }
+        if (ANYFUNC(p)->argcount)
+        {
+            for(i = 0; i < ANYFUNC(p)->argcount; i++)
+                SBH(GET_MB_HEAD(ANYFUNC(p)->args[i]))->mark = 1;
+            SBH(GET_MB_HEAD(ANYFUNC(p)->args))->mark = 1;
+        }
+        return;
+    }
+    if (IS_ANY_WORD(p) && (TYPE(p) != TYPE_REFINEMENT))
+        MarkValue(WORD(p)->ctx);
+}
+
+void CleanValueFrame(SFRMV *frm)
+{
+    ULONG **top;
+
+    for (top = (ULONG **)frm->top; (void *)top >= frm->stack; top--)
+        **top = (ULONG)0;
+}
+
+void SweepValues()
+{
+    SFRMV *frm;
+    ULONG i;
+    void *p;
+    ULONG **top;
+
+    frm = mem.values.active;
+
+    top = frm->stack;
+    for(i = 0; i < MAX_VALUES; i++)
+    {
+        p = (void *)((char *)frm->base + ((MAX_VALUES - 1) * max_value_size) - i * max_value_size);
+        if (!HEADER(p)->mark)
+        {
+            *top = p;
+/*
+            if (VTABLE(p)->Free)
+                VTABLE(p)->Free(p);
+*/
+            **top = (ULONG)0;
+            top++;
+        }
+        else
+            HEADER(p)->mark = 0;
+    }
+    frm->top = (void **)top;
+}
+
+void SweepData()
+{
+    MBH	*p, *q;
+
+    p = mem.data.head;
+    while (p)
+    {
+        if (!p->mark && !p->save)
+        {
+            q = p->next;
+            FreeMem(GET_MB_DATA(p));
+            p = q;
+        }
+        else
+        {
+            p->mark = 0;
+            p = p->next;
+        }
+    }
+}
+
+void GarbageCollect()
+{
+    struct ctx_def *table;
+    ULONG i;
+
+/* DumpValueFrame(mem.values.active); */
+
+    /*--- Mark phase---*/
+
+    MarkValue(global_ctx);
+
+    table = global_ctx->table;
+    for (i = 0; i < global_ctx->tail ; i++)
+    {
+        if (table[i].value)
+            MarkValue(table[i].value);
+    }
+
+    MarkValue(main_task->exec->blk);
+    if (main_task->value)
+        MarkValue(main_task->value);
+
+    MarkValue(function_methods.NativeMakeType);
+    MarkValue(op_methods.NativeMakeType);
+
+    /*--- Sweep phase---*/
+
+    CleanValueFrame(mem.values.active);
+    SweepValues();
+    SweepData();
+
+/* DumpValueFrame(mem.values.active); */
+}
+
+void CheckGC()
+{
+/*	GarbageCollect(); */
+}
+
+/*======= Global functions & natives =======*/
+
+void *InitMem()
+{
+    InitValueMem();
+
+    return mem.values.active;
+}
+
+void FreeAllMem()
+{
+    SFRMV *vfrm, *v;
+    MBH *p, *q;
+
+    FreeTask(main_task);
+    FreeSymbolsTable();
+
+    vfrm = mem.values.head;
+    while (vfrm)
+    {
+        v = vfrm->next;
+        free(vfrm);
+        vfrm = v;
+    }
+
+    p = mem.data.head;
+    while (p)
+    {
+        q = p->next;
+        free(p);
+        p = q;
+    }
+
+}
+
+VALUE RS_Recycle(VALUE *args, VALUE *refs)
+{
+    GarbageCollect();
+    return unset_value;
+}
+
+VALUE RS_Stats(VALUE *args, VALUE *refs)
+{
+    ULONG cnt, total;
+    SFRMV *vfrm;
+    MBH *p;
+
+    printf("\n--VALUE info--\n");
+    cnt = ((char *)mem.values.active->base - (char *)mem.values.active->top) / sizeof(void *) + 1;
+    printf("Active Frame Values\t= %lu/%lu\n", cnt, MAX_VALUES);
+
+    cnt = total = 0;
+    vfrm = mem.values.head;
+    while (vfrm)
+    {
+        cnt += ((char *)vfrm->base - (char *)vfrm->top) / sizeof(void *) + 1;
+        total += MAX_VALUES;
+        vfrm = vfrm->next;
+    }
+    printf("Values\t\t\t= %lu/%lu\n", cnt, total);
+
+    printf("\n--DATA info--\n");
+    cnt = total = 0;
+    p = mem.data.head;
+    while (p) 
+    { 
+        total += p->size;
+        cnt++;
+        p = p->next;
+    }
+    printf("Allocated blocks\t= %lu\n", cnt);
+    printf("Total bytes\t\t= %lu\n", total);
+
+    return unset_value;
+}
+#include "rsharp.h"
+
+
+/* Case-insensitive comparaison of a string and a array of n bytes*/
+
+char strncmpi(char *a, char *b, ULONG n)
+{
+    ULONG i;
+
+    for(i = 0; i < n; i++, a++, b++)
+        if (tolower(*a) != tolower(*b))						/* case insensitive comparison */
+            return *a < *b ? 1 : -1;
+    return 0;
+}
+
+UBYTE strncmp_equal(char *a, char *b, int n)		/* returns: 1 => equal, 0 => different */
+{
+    while (*a && n--)							/* should add && *b to avoid memory violation in protected OS */
+        if (!(tolower(*a++) == tolower(*b++)))
+            return 0;
+
+    if (*a || n)
+        return 0;
+
+    return 1;
+}
+
+char CompareSymbols(ULONG a, ULONG b)
+{
+    ULONG sizeA, sizeB;
+
+    sizeA = strlen(symbols.list[a]);
+    sizeB = strlen(symbols.list[b]);
+    if (sizeA == sizeB)
+        return strncmpi(symbols.list[a], symbols.list[b], sizeA);
+    else
+        return sizeA < sizeB ? 1 : -1;
+}
+
+long FindSymbol(char *start, int len)
+{
+    long i;
+
+    for (i = 0; i < (long)symbols.tail; i++)
+        if (strncmp_equal(symbols.list[i], start, len))
+            return i;
+    return -1;
+}
+
+ULONG AddSymbol(char *start, int len)
+{
+    char *str;
+    long i;
+
+    for (i = 0; i < (long)symbols.tail; i++)
+        if ((strncmp(symbols.list[i], start, len) == 0) && (strlen(symbols.list[i]) == (UWORD)len))
+            return (ULONG)i;
+
+    if (symbols.tail == symbols.slots)
+    {
+        symbols.slots *= 2;
+        symbols.list = realloc(symbols.list, symbols.slots * sizeof(char *));
+    }
+
+    _ASSERT(len < 1024);					/* Temporary limit word size to 1024 */
+    str = AllocMemForever(len + 1);			/* Extra byte allocated for ending zero */
+    strncpy(str, start, len);
+    str[len] = '\0';
+    symbols.list[symbols.tail++] = str;
+    return (ULONG)symbols.tail - 1;
+}
+
+char *GetSymbol(ULONG idx)
+{
+    return symbols.list[idx];
+}
+
+void InitSymbolsTable(void)
+{
+    symbols.slots = 1000;
+    symbols.list = malloc(symbols.slots  * sizeof(char *));
+    symbols.tail = 0;
+
+/*	sym_local = AddSymbol("local", 5);	*/		/* Useful for function spec block processing */
+}
+
+void FreeSymbolsTable(void)
+{
+    free(symbols.list);
+}
+
+
+void DumpSymbols()
+{
+    ULONG i;
+
+    for (i = 0; i < symbols.tail; i++)
+        printf("%s ", symbols.list[i]);
+}
+#include "rsharp.h"
+
+#define IS_DELIMITER(i)		charset_delimiters[i>>3] & 1<<(i%8)
+#define IS_DIGIT(v)			('0' <= v) && (v <= '9')
+#define SYN_ERROR(x)		NewError(0, x, blk_stack[top])
+#define STACK_MAX_SIZE		256
+
+#define ST_START		0
+#define ST_BLOCK		1
+#define ST_STRING		3
+#define ST_PLUSMINUS	10
+#define ST_INT			11
+#define ST_GETWORD		19
+#define ST_GETWORDE		20
+#define ST_WORD			21
+#define ST_SETWORD		22
+#define ST_PATHBEG		23
+#define ST_PATHE		24
+#define ST_PATHNUM		25
+#define ST_PATHGETW		26
+#define ST_SETPATH		27
+#define ST_LITMODE		28
+#define ST_REFINBEG		29
+#define ST_REFINEW		30
+#define ST_COMMENT		31
+#define ST_SHARP		32
+#define ST_CHARBEG		33
+#define ST_CHARANY		34
+#define ST_CHARCLOSE	35
+#define ST_CHAREND		36
+
+
+/* Blanks: null space tab cr lf */
+UBYTE charset_blanks[32] = {
+    0x01,0x26,0x00,0x00,0x01,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+/* Delimiters: [](){}"; null space tab cr lf */
+UBYTE charset_delimiters[32] = {
+    0x01,0x26,0x00,0x00,0x05,0x03,0x00,0x08,
+    0x00,0x00,0x00,0x28,0x00,0x00,0x00,0x28,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00
+};
+/* Strict Word: a-z A-Z ?!.*&|=_~ and all ascii >= 127  */
+UBYTE charset_sword[32] = {
+    0x00,0x00,0x00,0x00,0x42,0x44,0x00,0xF0,
+    0xFE,0xFF,0xFF,0x97,0xFF,0xFF,0xFF,0x57,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+};
+/* Word: 0-9 a-z A-Z ?!.'+-*&|=_~ and all ascii >= 127 */
+UBYTE charset_word[32] = {
+    0x00,0x00,0x00,0x00,0xC2,0x6C,0xFF,0xF3,
+    0xFE,0xFF,0xFF,0x97,0xFF,0xFF,0xFF,0x57,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+};
+
+VBLOCK blk_stack[STACK_MAX_SIZE];
+
+VALUE Tokenize(char *src, char *end)
+{
+    VPATH	path;
+    VALUE	val;
+    char	type;
+    int		top = 0, get_mode = 0, lit_mode = 0;
+    int		state = ST_START;
+    char	*tok_start, close_type;
+
+    blk_stack[0] = NewBlock(0);
+    close_type = ']';						/* just needed for distincton between paren! and block! errors */
+
+    if ((strlen(src) == 0) || (src == end))
+        return blk_stack[0];
+
+    path = NULL;
+
+    tok_start = src--;						/* simplify detection of end of string */
+    for(;;)
+    {
+        src++;
+        switch(state)
+        {
+            case ST_START:
+
+                if (IN_BITSET(charset_blanks, *src))
+                    break;
+
+                tok_start = src;
+                lit_mode = 0;
+
+                if (IS_DIGIT(*src))	/* 0..9 */
+                {
+                    state = ST_INT;
+                    break;
+                }
+                if (IN_BITSET(charset_sword,*src))
+                {
+                    state = ST_WORD;
+                    break;
+                }
+                switch(*src)
+                {
+                    case '+': state = ST_PLUSMINUS; break;
+                    case '-': state = ST_PLUSMINUS; break;
+                    case ':': state = ST_GETWORD;	break;
+                    case '"': state = ST_STRING;	break;
+                    case '/': state = ST_REFINBEG;	break;
+                    case ';': state = ST_COMMENT;	break;
+                    case '#': state = ST_SHARP;		break;
+                    case '\'': state = ST_LITMODE;	break;
+                    case '[':
+                        _ASSERT(top < STACK_MAX_SIZE);
+                        blk_stack[++top] = NewBlock(0);
+                        break;
+                    case ']':
+                        top--;
+                        close_type = ']';
+                        if (top >= 0)
+                            AppendBlock(blk_stack[top], blk_stack[top + 1]);
+                        break;
+                    case '(':
+                        _ASSERT(top < STACK_MAX_SIZE);
+                        blk_stack[++top] = NewParen(0);
+                        break;
+                    case ')':
+                        top--;
+                        close_type = ')';
+                        if (top >= 0)
+                            AppendParen(PAREN(blk_stack[top]), blk_stack[top + 1]);
+                        break;
+                }
+                break;
+
+            case ST_STRING:
+
+                if (*src == '"')
+                {
+                    val = NewString(tok_start + 1, src - tok_start - 1);
+                    AppendBlock(blk_stack[top], val);
+                    state = ST_START;
+                    break;
+                }
+                if (*src == '^')
+                {
+                    /* Escape sequence : TBD */
+                    break;
+                }
+                break;
+
+            case ST_WORD:
+
+                if (IN_BITSET(charset_word, *src))
+                    break;
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    type = lit_mode ? TYPE_LIT_WORD : TYPE_WORD;
+                    val = NewWord(tok_start, src - tok_start, type);
+                    AppendBlock(blk_stack[top], val);
+                    state = ST_START;
+                    src--;
+                    break;
+                }
+                if (*src == ':')
+                {
+                    state = ST_SETWORD;
+                    break;
+                }
+                if (*src == '/')
+                {
+                    state = ST_PATHBEG;
+                    break;
+                }
+                return NewError(0, 0, blk_stack[top]);
+                break;
+
+            case ST_INT:
+
+                if (IS_DIGIT(*src))
+                    break;
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    val = NewInteger(tok_start, src - tok_start);
+                    AppendBlock(blk_stack[top], val);
+                    src--;
+                    state = ST_START;
+                    break;
+                }
+                return NewError(0, 1, blk_stack[top]);
+                break;
+
+            case ST_PLUSMINUS:
+
+                if (IS_DIGIT(*src))
+                {
+                    state = ST_INT;
+                    break;
+                }
+                if (IN_BITSET(charset_word, *src))
+                {
+                    state = ST_WORD;
+                    break;
+                }
+                src--;
+                state = ST_WORD;
+                break;
+
+            case ST_GETWORD:
+
+                if (IN_BITSET(charset_sword,*src) || (*src == '+') || (*src == '-'))
+                {
+                    state = ST_GETWORDE;
+                    break;
+                }
+                return NewError(0, 2, blk_stack[top]);
+                break;
+
+            case ST_GETWORDE:
+
+                if (IN_BITSET(charset_word, *src))
+                    break;
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    val = NewWord(tok_start + 1, src - tok_start - 1, TYPE_GET_WORD);
+                    AppendBlock(blk_stack[top], val);
+                    src--;
+                    state = ST_START;
+                    break;
+                }
+                return NewError(0, 2, blk_stack[top]);
+                break;
+
+            case ST_SETWORD:
+
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    val = NewWord(tok_start, src - tok_start - 1, TYPE_SET_WORD);
+                    AppendBlock(blk_stack[top], val);
+                    src--;
+                    state = ST_START;
+                    break;
+                }
+                return NewError(0, 3, blk_stack[top]);
+                break;
+
+            case ST_PATHBEG:
+
+                if (!path)
+                {
+                    path = NewPath(0);
+                    if (lit_mode)
+                        path->type = TYPE_LIT_PATH;
+
+                    AppendBlock(blk_stack[top], path);
+                    val = NewWord(tok_start, src - tok_start - 1, TYPE_WORD);
+                    AppendPath(path, val);
+                }
+                tok_start = src;
+                get_mode = 0;
+                if (*src == ':')
+                {
+                    get_mode = 1;
+                    state = ST_PATHGETW;
+                    break;
+                }
+                if (IN_BITSET(charset_sword,*src))
+                {
+                    state = ST_PATHE;
+                    break;
+                }
+                if (IS_DIGIT(*src))	/* 0..9 */
+                {
+                    state = ST_PATHNUM;
+                    break;
+                }
+                return NewError(0, 9, blk_stack[top]);
+                break;
+
+            case ST_PATHE:
+
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    type = get_mode ? TYPE_GET_WORD : TYPE_WORD;
+                    val = NewWord(tok_start, src - tok_start, type);
+                    AppendPath(path, val);
+                    state = ST_START;
+                    path = NULL;
+                    src--;
+                    break;
+                }
+                if (IN_BITSET(charset_word, *src))
+                {
+                    state = ST_PATHE;
+                    break;
+                }
+                if ((*src == '/') || (*src == ':'))
+                {
+                    type = get_mode ? TYPE_GET_WORD : TYPE_WORD;
+                    val = NewWord(tok_start, src - tok_start, type);
+                    AppendPath(path, val);
+                    state = (*src == '/') ? ST_PATHBEG : ST_SETPATH;		/* à vérifier ! */
+                    break;
+                }
+                return NewError(0, 9, blk_stack[top]);
+                break;
+
+            case ST_PATHNUM:
+
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    val = NewInteger(tok_start, src - tok_start);
+                    AppendPath(path, val);
+                    state = ST_START;
+                    path = NULL;
+                    src--;
+                    break;
+                }
+                if (IS_DIGIT(*src))	/* 0..9 */
+                {
+                    state = ST_PATHNUM;
+                    break;
+                }
+                if ((*src == '/') || (*src == ':'))
+                {
+                    val = NewInteger(tok_start, src - tok_start);
+                    AppendPath(path, val);
+                    state = (*src == '/') ? ST_PATHBEG : ST_SETPATH;
+                    break;
+                }
+                return NewError(0, 9, blk_stack[top]);
+                break;
+
+            case ST_PATHGETW:
+
+                if (IN_BITSET(charset_sword,*src))
+                {
+                    tok_start = src;
+                    state = ST_PATHE;
+                    break;
+                }
+                return NewError(0, 9, blk_stack[top]);
+                break;
+
+            case ST_SETPATH:
+        
+                path->type = TYPE_SET_PATH;
+                path = NULL;
+                state = ST_START;
+                break;
+
+            case ST_LITMODE:
+        
+                lit_mode = 1;
+                if (IN_BITSET(charset_sword,*src) || (*src == '+') || (*src == '-'))
+                {
+                    tok_start++;
+                    state = ST_WORD;
+                    break;
+                }
+                return NewError(0, 17, blk_stack[top]);
+                break;
+
+            case ST_REFINBEG:
+
+                if (IN_BITSET(charset_sword,*src))
+                {
+                    state = ST_REFINEW;
+                    break;
+                }
+                if (*src == ':')
+                {
+                    state = ST_SETWORD;
+                    break;
+                }
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    val = NewWord(tok_start, src - tok_start, TYPE_WORD);
+                    AppendBlock(blk_stack[top], val);
+                    state = ST_START;
+                    src--;
+                    break;
+                }
+                return NewError(0, 10, blk_stack[top]);
+                break;
+
+            case ST_REFINEW:
+
+                if (IS_DELIMITER(*src) || (src == end))
+                {
+                    tok_start++;
+                    val = NewRefinement(tok_start, src - tok_start);
+                    AppendBlock(blk_stack[top], val);
+                    state = ST_START;
+                    src--;
+                    break;
+                }
+                if (IN_BITSET(charset_word,*src))
+                {
+                    state = ST_REFINEW;
+                    break;
+                }
+                return NewError(0, 10, blk_stack[top]);
+                break;
+
+            case ST_COMMENT:
+
+                if ((*src != '\n') || (src == end))
+                {
+                    state = ST_COMMENT;
+                    break;
+                }
+                state = ST_START;
+                break;
+
+            case ST_SHARP:
+                
+                if (*src == '"')
+                {
+                    state = ST_CHARBEG;
+                    break;
+                }
+                return NewError(0, 21, blk_stack[top]);
+                break;
+
+            
+            case ST_CHARBEG:
+                
+                if (*src == '"')
+                {
+                    type = -1;
+                    state = ST_CHAREND;
+                    break;
+                }
+                if (*src == '^')
+                {
+                    type = 1;
+                    state = ST_CHARANY;
+                    break;
+                }
+                type = 0;
+                state = ST_CHARCLOSE;
+                break;
+
+            case ST_CHARANY:
+                
+                state = ST_CHARCLOSE;
+                break;
+
+            case ST_CHARCLOSE:
+
+                if (*src == '"')
+                {
+                    state = ST_CHAREND;
+                    break;
+                }
+                return NewError(0, 21, blk_stack[top]);
+
+            case ST_CHAREND:
+            
+                val = NewChar(*(tok_start + 2 + type), type);
+                AppendBlock(blk_stack[top], val);
+                state = ST_START;
+                src--;
+                break;
+
+        }
+        if (!*src || (end && src > end))
+            break;
+    }
+
+    if (state == ST_STRING)
+        return NewError(0, 4, blk_stack[top]);
+
+    if (top > 0)
+    {
+        if (TYPE(blk_stack[top]) == TYPE_BLOCK)
+            return NewError(0, 5, blk_stack[top]);
+        else
+            return NewError(0, 18, blk_stack[top]);
+    }
+
+    if (top < 0)
+    {
+        if (close_type == ']')
+            return NewError(0, 16, NULL);
+        else
+            return NewError(0, 19, NULL);
+    }
+
+    return blk_stack[0];
+}
+

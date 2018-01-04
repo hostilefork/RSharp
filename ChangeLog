@@ -1,0 +1,115 @@
+v0.6.0, 09-09-2003
+------------------
+
+* Changes :
+
+    - New garbage collector and memory manager.
+        - Mark&Sweep collector
+        - Memory model simplified
+        - Previous memory issues solved (leaking, limitations)    
+            
+    - Interpreter major refactoring:
+        - FSM cleaned up and extended
+        - Correct error! propagation and catching ('try)
+        - Faster main loop execution
+        
+* Additions :
+
+    - General path! and set-path! evaluation supported with unlimited depth.
+      Currently supported datatypes combinations are :
+        
+        o any-block!/integer!
+        o any-block!/get-word!    (word pointing to an integer!)
+        o any-string!/integer!
+        o any-string!/get-word!    (word pointing to an integer!)
+    
+    - Exception handling implemented (try, catch, throws, named throws)
+
+    - New native: value?
+    - New native: unset
+    - New native: until
+    - New native: while
+    - New native: break
+    - New native: catch
+    - New native: throw
+    - New native: any
+    - New native: all
+    - New native: return
+    - New native: try
+    - New native: error?
+    - New native: exit
+    - New native: uppercase        (contribution from Volker Nitsch)
+    - New native: lowercase     (       "        "    "      "   )
+
+    - New definition: forall
+    - New definition: attempt
+    - New definition: last
+
+* Bugfixes :
+
+    - Experimental change in words evaluating to series! => new value allocated each time.
+      (Fixes the 'reduce [a next a] class of bugs, but increase memory usage)
+
+    - copy/part now works well with series! /part argument (due to the change in word evaluation)
+
+    - Fix in words lookup in contexts (wrong result in some rare cases).
+    
+
+
+v0.5.1, 15-07-2003
+------------------
+
+* Additions :
+
+    - New refinement : /only for 'insert native
+    
+    - New words added to global context:
+            o any-word!
+            o any-string!
+            o any-block!
+    
+    - New native: set
+    - New native: get
+    - New native: copy    (/deep not supported)
+    - New native: zero?
+    - New native: not
+    
+    - New native: equal?
+    - New native: strict-equal?
+    - New native: same?
+    - New native: not-equal?
+    - New native: lesser?
+    - New native: lesser-or-equal?
+    - New native: greater?
+    - New native: greater-or-equal?
+    
+    - New operator: =
+    - New operator: ==
+    - New operator: =?
+    - New operator: <>
+    - New operator: <
+    - New operator: <=
+    - New operator: >
+    - New operator: >=
+
+    - New: temporary new mezzanine definitions :
+
+        integer?, block?, char?, datatype?, error?, function?,
+        none?, logic?, unset?, native?, op?, paren?, path?,
+        refinement?, string?, word?
+            
+        first, second, third, fourth, fifth        (support series! only)
+        
+* BugFixes:
+
+    - 'insert now works correctly with char! values.
+    - 'insert/dup doesn't crash anymore on negative count values.
+    - 'false evaluation was printing true on console. (bug introduced in release version ;-( )
+
+* Misc :
+
+    - integer! values will now correctly report errors when they can't be created.
+    - integer! math operations now signals overflows (except for multiplication)
+
+    - better ANSI compatibility
+    - added separate files for OS specific code.

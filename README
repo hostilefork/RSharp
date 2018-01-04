@@ -1,0 +1,84 @@
+R# version 0.6.0, 09/09/2003
+
+
+Brief:
+-----
+R# [R-Sharp] is a free programming language based on the REBOL(tm) language.
+
+
+Description :
+-----------
+Here's a short description of currently supported features :
+
+action!     Full support  (used for functions that need access to the interpreter structure)
+block!      Full support. (lacks newlines storing)
+char!       Full support. (except special escaping sequences)
+context!    Full support. (not first class values)
+datatype!   Full support.
+error!      Partial support. (cannot been 'disarmed yet, poor location info)
+function!   Full support. (max arguments = 4, recursion = partial support)
+integer!    Full support.
+none!       Full support.
+unset!      Partial support. (no optional arguments support)
+logic!      Full support.
+native!     Full support.
+op!         Full support. (user-created op! supported from native!)
+paren!      Full support.
+path!       Full support.
+lit-path!   Full support.
+set-path!   Full support.
+get-path!   Full support.
+refinement! Full support.
+string!     Full support. (except for escaped characters)
+word!       Full support.
+lit-word!   Full support.
+get-word!   Full support.
+set-word!   Full support.
+
+For native! and action! lists, see includes/natives.h file.
+For predefined op!, words, and functions, see boot.rs at root level.
+
+Memory is managed automatically by R#.
+
+The new memory handler and GC are more accurate, reliable and stable than the previous ones. In the current version, the GC doesn't run automatically, it has to be called by the user. Also, it won't release empty value frames and doesn't fully handle yet multiple frames. These issues will be fixed in the future releases.
+
+
+Compilation:
+-----------
+
+* Win32: project files for VisualC++ 6.0 are supplied (main development platform).
+
+* POSIX compliant OS: a general Makefile is provided. To compile on your machine, just call "make".
+
+The current version has been successfuly compiled on the following platforms :
+
+- Windows 2000 / ix86  / VC6.0 SP5
+- Linux 2.4.18 / ix86  / GCC 2.95.4
+- Linux 2.4.18 / ix86  / TCC 0.9.19
+
+
+Authors:
+------
+Nenad Rakocevic - Softinnov (main coding)   nr@softinnov.com
+Brahim Hamdouni - Softinnov (unix port)     bh@softinnov.com
+Arnaud Payement - (bigint! library)         payement.arnaud@wanadoo.fr
+Volker Nitsch   - (additionnal coding)      nitsch-lists@netcologne.de
+
+
+Greetings:
+---------
+Special thanks to Fred "LeBaron" Georges for his high bug-finding skills. ;-)
+
+
+Licensing :
+---------
+All R# source files are distributed under the GNU Public License v2 (complete terms are in the COPYING file).
+
+A BSD License is granted to REBOL Technologies to allow the reuse of any part of R# source code in their own products.
+
+
+Copyrights:
+----------
+R# is copyrighted by Softinnov. http://www.softinnov.com (sorry, french only)
+
+REBOL, REBOL/Core are trademarks of REBOL Technologies. http://www.rebol.com
